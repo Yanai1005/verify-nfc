@@ -1,6 +1,6 @@
 # FeliCa 学生証読み取り 技術調査ログ
 
-Sony RC-S300 (PaSoRi 4.0) で FeliCaを読み取るための調査記録。
+Sony RC-S300 (PaSoRi 4.0) で立命館大学の学生証 (FeliCa) を読み取るための調査記録。
 
 ---
 
@@ -496,6 +496,55 @@ polling_cmd = bytes([0x06, 0x04, 0xFF, 0xFF, 0x01, 0x0F])
 | サービス列挙 | ❌ | ❌ | 🔧 調査中 |
 | ブロック読み取り | ❌ | ❌ | 🔧 調査中 |
 | Polling | ❌ | ❌ | 🔧 調査中 |
+
+---
+
+## Phase 9: felica.dll 戻り値の再解釈 (ハンドル仮説)
+
+### 重要な発見
+
+`open_reader_writer_auto()` の戻り値が毎回異なる大きな値を返す現象を分析した結果、
+これらは**エラーコードではなくポートハンドル**である可能性が高いことが判明。
+
+#### 根拠
+
+1. **値が毎回異なる**: エラーコードなら固定値のはずだが、540994817, -1667305727, 1587474177, 1268706305 と毎回違う
+2. **パターン**: 下位バイトに 0x01 が含まれる傾向 → メモリアドレスのアライメント
+3. **`c_int` の 32bit 制限**: 64bit Windows で `restype = c_int` だと上位 32bit が切り捨てられ、符号付き整数として不正な値に見える
+4. **以前の成功パターン**: `byref(port)` で呼んだ時 ret=0, port=None だった → 引数なし版の **戻り値そのもの** がハンドル
+
+#### 修正内容
+
+```python
+# Before (間違い):
+dll.open_reader_writer_auto.restype = c.c_int  # 32bit truncation!
+ret = dll.open_reader_writer_auto()
+if ret != 0: print("エラー!")  # ← ハンドルをエラーと誤判定
+
+# After (修正):
+dll.open_reader_writer_auto.restype = c.c_void_p  # 64bit対応
+handle = dll.open_reader_writer_auto()
+if handle: print(f"成功! handle=0x{handle:X}")  # ← 正しくハンドルとして扱う
+```
+
+#### initialize_library の戻り値も再解釈
+
+- `→ 1`: **成功** (初回初期化)
+- `→ 0`: **失敗** (既に初期化済み)
+- 根拠: `set_polling_timeout(10000) → 1`, `set_time_out(10000) → 1` も同様に 1=成功パターン
+
+#### テスト方法 (5通り)
+
+| 方式 | 説明 |
+|------|------|
+| A | `open_reader_writer_auto()` 引数なし、`restype=c_void_p` |
+| B | 同上、`restype=c_int` (後方互換確認) |
+| C | `open_reader_writer_without_encryption()` |
+| D | `open_reader_writer_auto(byref(port))` where port=`c_void_p` |
+| E | 同上、port=`c_uint64` |
+
+ハンドル取得後 `reader_writer_is_open()` / `reader_writer_is_alive()` で状態確認し、
+`polling_and_get_card_information(handle, &sc, idm, pmm, &num)` でカード検出を試行する。
 
 ---
 
